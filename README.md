@@ -114,3 +114,153 @@ index.html -> index.html.tpl
 
 </html>
 ```
+
+
+**DevOps с Nixys | Знакомство с Terraform**
+
+terraform apply -auto-approve - создание с автоподтверждением
+
+terraform fmt - автоформатирование
+
+terraform destroy -target yandex_compute_instance.nixys - уничтожение только определенного инстанса
+
+.tf - файлы конфигурации
+
+.tfvars - файлы переменных
+
+.tfstate - файлы текущего состояния инфраструктуры
+
+.terraform - скаченные провайдеры, указанный в конфигурации
+
+.terraform.lock.hcl - описываются зависимости модулей и провайдеров
+
+main.tf
+```tf
+terraform {
+  required_providers {
+    yandex = {
+      source = "yandex-cloud/yandex"
+    }
+  }
+  required_version = ">= 0.13"
+
+    // сохраняем terraform1.tfstate на сервере
+    backend "s3" {
+    endpoint   = "storage.yandexcloud.net"
+    bucket     = "test-joos"
+    region     = "ru-central1"
+    key        = "terraform1.tfstate"
+    shared_credentials_file = "storage.key"
+
+    skip_region_validation      = true
+    skip_credentials_validation = true
+  }
+}
+
+provider "yandex" {
+  service_account_key_file = "/Users/joos/MyTerraform/25min/authorized_key.json"
+  cloud_id                 = "b1gmtujeraulvnf2bj1i"
+  folder_id                = "b1ghauke2h8p27vt648a"
+  zone                     = "ru-central1-b"
+}
+
+//сеть
+resource "yandex_vpc_network" "test-vpc" {
+  name = "nixys"
+}
+
+//подсеть
+resource "yandex_vpc_subnet" "test-subnet" {
+  v4_cidr_blocks = ["10.2.0.0/16"]
+  network_id     = "${yandex_vpc_network.test-vpc.id}"
+}
+
+// создаем группу безопасности
+resource "yandex_vpc_security_group" "test-sg" {
+  name        = "Test security group"
+  description = "Description for security group"
+  network_id  = "${yandex_vpc_network.test-vpc.id}"
+
+  dynamic "ingress" {
+    for_each = ["80", "8080"]
+    content {
+      protocol       = "TCP"
+      description    = "Rule description 1"
+      v4_cidr_blocks = ["0.0.0.0/0"]
+      from_port      = ingress.value
+      to_port        = ingress.value
+    }
+  }
+
+  egress {
+    protocol       = "ANY"
+    description    = "Rule description 2"
+    v4_cidr_blocks = ["0.0.0.0/0"]
+    from_port      = 0
+    to_port        = 65535
+  }
+}
+
+// делаем статический адрес
+resource "yandex_vpc_address" "test-ip" { 
+  name = "justAdress"
+  external_ipv4_address {
+    zone_id = "ru-central1-b"
+  }  
+}
+
+// создаем компьютер
+resource "yandex_compute_instance" "nixys" {
+  name  = "nixys"
+  platform_id = "standard-v3"
+
+  resources {
+  core_fraction = 20
+  cores     = 2
+  memory    = 2
+  }
+
+  boot_disk {
+    initialize_params {
+      image_id = "fd81ojtctf7kjqa3au3i"
+    }
+  }
+  network_interface {
+    subnet_id = yandex_vpc_subnet.test-subnet.id
+    nat       = true
+    nat_ip_address = yandex_vpc_address.test-ip.external_ipv4_address.0.address
+  }
+  
+  // для подключения пользователя и исполняемый файл
+  metadata = {
+    ssh-keys = "debian:${file("/Users/joos/.ssh/id_rsa.pub")}"
+    user-data = "${file("./init.sh")}"
+  }
+}
+
+// выводы
+output "external_ip" {
+  value = yandex_vpc_address.test-ip.external_ipv4_address.0.address
+}
+
+output "external_ip2" {
+  value = yandex_compute_instance.nixys.network_interface.0.nat_ip_address
+}
+```
+init.sh
+```sh
+#!/bin/bash
+
+### Install
+
+apt-get update && apt-get install -y apt-transport-https ca-certificates curl software-properties-common nginx
+echo "<h2>Joos</h2>" > /var/www/html/index.html
+sudo service nginx start
+```
+storage.key  - сервисные аккаунты - аккаунт - создать новый статический ключ
+```key
+[default]
+  aws_access_key_id = user.key1
+  aws_secret_access_key = user.key2
+```
+
