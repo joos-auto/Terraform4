@@ -134,7 +134,7 @@ terraform destroy -target yandex_compute_instance.nixys - уничтожение
 
 .terraform.lock.hcl - описываются зависимости модулей и провайдеров
 
-main.tf
+main.tf - пример поднятия веб сервера через скрипт
 ```tf
 terraform {
   required_providers {
@@ -264,7 +264,7 @@ storage.key  - сервисные аккаунты - аккаунт - созда
   aws_secret_access_key = user.key2
 ```
 
-main.tf
+main.tf - пример кластера с nginx с автомасштабированием
 ```tf
 terraform {
   required_providers {
