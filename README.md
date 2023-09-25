@@ -264,3 +264,396 @@ storage.key  - сервисные аккаунты - аккаунт - созда
   aws_secret_access_key = user.key2
 ```
 
+main.tf
+```tf
+terraform {
+  required_providers {
+    yandex = {
+      source = "yandex-cloud/yandex"
+    }
+  }
+
+    // сохраняем terraform1.tfstate на сервере
+    backend "s3" {
+    endpoint   = "storage.yandexcloud.net"
+    bucket     = "test-joos"
+    region     = "ru-central1"
+    key        = "terraform_kub.tfstate"
+    shared_credentials_file = "storage.key"
+
+    skip_region_validation      = true
+    skip_credentials_validation = true
+  }
+}
+
+provider "yandex" {
+  service_account_key_file = "/Users/joos/MyTerraform/25min/authorized_key.json"
+  cloud_id                 = "b1gmtujeraulvnf2bj1i"
+  folder_id                = "b1ghauke2h8p27vt648a"
+  zone                     = "ru-central1-b"
+}
+
+# Переменные
+locals {
+  cloud_id    = "b1gmtujeraulvnf2bj1i"
+  folder_id   = "b1ghauke2h8p27vt648a"
+  k8s_version = "1.24"
+  sa_name     = "myaccount"
+}
+# Сеть
+resource "yandex_vpc_network" "mynet" {
+  name = "mynet"
+}
+# Подсети
+resource "yandex_vpc_subnet" "mysubnet-a" {
+  v4_cidr_blocks = ["10.5.0.0/16"]
+  zone           = "ru-central1-a"
+  network_id     = yandex_vpc_network.mynet.id
+}
+
+resource "yandex_vpc_subnet" "mysubnet-b" {
+  v4_cidr_blocks = ["10.6.0.0/16"]
+  zone           = "ru-central1-b"
+  network_id     = yandex_vpc_network.mynet.id
+}
+
+resource "yandex_vpc_subnet" "mysubnet-c" {
+  v4_cidr_blocks = ["10.7.0.0/16"]
+  zone           = "ru-central1-c"
+  network_id     = yandex_vpc_network.mynet.id
+}
+# Группы безопасности
+resource "yandex_vpc_security_group" "k8s-main-sg" {
+  name        = "k8s-main-sg"
+  description = "Правила группы обеспечивают базовую работоспособность кластера Managed Service for Kubernetes. Примените ее к кластеру Managed Service for Kubernetes и группам узлов."
+  network_id  = yandex_vpc_network.mynet.id
+  ingress {
+    protocol          = "TCP"
+    description       = "Правило разрешает проверки доступности с диапазона адресов балансировщика нагрузки. Нужно для работы отказоустойчивого кластера Managed Service for Kubernetes и сервисов балансировщика."
+    predefined_target = "loadbalancer_healthchecks"
+    from_port         = 0
+    to_port           = 65535
+  }
+  ingress {
+    protocol          = "ANY"
+    description       = "Правило разрешает взаимодействие мастер-узел и узел-узел внутри группы безопасности."
+    predefined_target = "self_security_group"
+    from_port         = 0
+    to_port           = 65535
+  }
+  ingress {
+    protocol          = "ANY"
+    description       = "Правило разрешает взаимодействие под-под и сервис-сервис. Укажите подсети вашего кластера Managed Service for Kubernetes и сервисов."
+    v4_cidr_blocks    = concat(yandex_vpc_subnet.mysubnet-a.v4_cidr_blocks, yandex_vpc_subnet.mysubnet-b.v4_cidr_blocks, yandex_vpc_subnet.mysubnet-c.v4_cidr_blocks)
+    from_port         = 0
+    to_port           = 65535
+  }
+  ingress {
+    protocol          = "ICMP"
+    description       = "Правило разрешает отладочные ICMP-пакеты из внутренних подсетей."
+    v4_cidr_blocks    = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  }
+  ingress {
+    protocol          = "TCP"
+    description       = "Правило разрешает входящий трафик из интернета на диапазон портов NodePort. Добавьте или измените порты на нужные вам."
+    v4_cidr_blocks    = ["0.0.0.0/0"]
+    from_port         = 30000
+    to_port           = 32767
+  }
+    ingress {
+    protocol          = "TCP"
+    description       = "Правило разрешает входящий трафик из интернета на диапазон портов NodePort. Добавьте или измените порты на нужные вам."
+    v4_cidr_blocks    = ["0.0.0.0/0"]
+    port         = 443
+  }
+  egress {
+    protocol          = "ANY"
+    description       = "Правило разрешает весь исходящий трафик. Узлы могут связаться с Yandex Container Registry, Yandex Object Storage, Docker Hub и т. д."
+    v4_cidr_blocks    = ["0.0.0.0/0"]
+    from_port         = 0
+    to_port           = 65535
+  }
+}
+# Создание сервисного аккаунта
+resource "yandex_iam_service_account" "myaccount" {
+  name        = local.sa_name
+  description = "K8S regional service account"
+}
+# Назначение ролей
+resource "yandex_resourcemanager_folder_iam_member" "editor" {
+  # Сервисному аккаунту назначается роль "editor".
+  folder_id = local.folder_id
+  role      = "admin"
+  member    = "serviceAccount:${yandex_iam_service_account.myaccount.id}"
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "images-puller" {
+  # Сервисному аккаунту назначается роль "container-registry.images.puller".
+  folder_id = local.folder_id
+  role      = "container-registry.images.puller"
+  member    = "serviceAccount:${yandex_iam_service_account.myaccount.id}"
+}
+
+resource "yandex_kms_symmetric_key" "kms-key" {
+  # Ключ для шифрования важной информации, такой как пароли, OAuth-токены и SSH-ключи.
+  name              = "kms-key"
+  default_algorithm = "AES_128"
+  rotation_period   = "8760h" # 1 год.
+}
+
+resource "yandex_resourcemanager_folder_iam_member" "viewer" {
+  folder_id = local.folder_id
+  role      = "viewer"
+  member    = "serviceAccount:${yandex_iam_service_account.myaccount.id}"
+}
+
+# Создание кластера
+resource "yandex_kubernetes_cluster" "k8s-regional" {
+  network_id = yandex_vpc_network.mynet.id
+  network_policy_provider = "CALICO"
+  master {
+    version = local.k8s_version
+    public_ip = true
+    regional {
+      region = "ru-central1"
+      # задействуем 3 подсети
+      location {
+        zone      = yandex_vpc_subnet.mysubnet-a.zone
+        subnet_id = yandex_vpc_subnet.mysubnet-a.id
+      }
+      location {
+        zone      = yandex_vpc_subnet.mysubnet-b.zone
+        subnet_id = yandex_vpc_subnet.mysubnet-b.id
+      }
+      location {
+        zone      = yandex_vpc_subnet.mysubnet-c.zone
+        subnet_id = yandex_vpc_subnet.mysubnet-c.id
+      }
+    }
+    security_group_ids = [yandex_vpc_security_group.k8s-main-sg.id]
+  }# Используем сервисные аккаунты
+  service_account_id      = yandex_iam_service_account.myaccount.id
+  node_service_account_id = yandex_iam_service_account.myaccount.id
+  depends_on = [# Указываем последовательность создания ресурсов
+    yandex_resourcemanager_folder_iam_member.editor,
+    yandex_resourcemanager_folder_iam_member.images-puller
+  ]
+  kms_provider {
+    key_id = yandex_kms_symmetric_key.kms-key.id
+  }
+}
+
+# Создаем группы нод
+resource "yandex_kubernetes_node_group" "my_node_group_a" {
+  cluster_id  = "${yandex_kubernetes_cluster.k8s-regional.id}"
+  name        = "worker-a"
+  description = "description"
+  version     = local.k8s_version
+
+  labels = {
+    "key" = "value"
+  }
+
+  instance_template {
+    platform_id = "standard-v3"
+    name = "worker-a-{instance.short_id}"
+
+    network_interface {
+      nat                = true
+      subnet_ids         = [yandex_vpc_subnet.mysubnet-a.id]
+      security_group_ids = [yandex_vpc_security_group.k8s-main-sg.id]
+    }
+
+    resources {
+      memory = 2
+      cores  = 2
+    }
+
+    boot_disk {
+      type = "network-hdd"
+      size = 20
+    }
+
+    scheduling_policy {
+      preemptible = false
+    }
+
+  }
+
+  scale_policy {
+    auto_scale {
+      min     = 1
+      max     = 3
+      initial = 1
+    }
+  }
+
+  allocation_policy {
+    location {
+      zone = "ru-central1-a"
+    }
+  }
+}
+
+resource "yandex_kubernetes_node_group" "my_node_group_b" {
+  cluster_id  = "${yandex_kubernetes_cluster.k8s-regional.id}"
+  name        = "worker-b"
+  description = "description"
+  version     = local.k8s_version
+
+  labels = {
+    "key" = "value"
+  }
+
+  instance_template {
+    platform_id = "standard-v3"
+    name = "worker-b-{instance.short_id}"
+
+    network_interface {
+      nat                = true
+      subnet_ids         = [yandex_vpc_subnet.mysubnet-b.id]
+      security_group_ids = [yandex_vpc_security_group.k8s-main-sg.id]
+    }
+
+    resources {
+      memory = 2
+      cores  = 2
+    }
+
+    boot_disk {
+      type = "network-hdd"
+      size = 32
+    }
+
+    scheduling_policy {
+      preemptible = false
+    }
+
+  }
+
+  scale_policy {
+    auto_scale {
+      min     = 1
+      max     = 3
+      initial = 1
+    }
+  }
+
+  allocation_policy {
+    location {
+      zone = "ru-central1-b"
+    }
+  }
+}
+
+resource "yandex_kubernetes_node_group" "my_node_group_c" {
+  cluster_id  = "${yandex_kubernetes_cluster.k8s-regional.id}"
+  name        = "worker-c"
+  description = "description"
+  version     = local.k8s_version
+
+  labels = {
+    "key" = "value"
+  }
+
+  instance_template {
+    platform_id = "standard-v3"
+    name = "worker-c-{instance.short_id}"
+
+    network_interface {
+      nat                = true
+      subnet_ids         = [yandex_vpc_subnet.mysubnet-c.id]
+      security_group_ids = [yandex_vpc_security_group.k8s-main-sg.id]
+    }
+
+    resources {
+      memory = 2
+      cores  = 2
+    }
+
+    boot_disk {
+      type = "network-hdd"
+      size = 32
+    }
+
+    scheduling_policy {
+      preemptible = false
+    }
+
+  }
+
+  scale_policy {
+    auto_scale {
+      min     = 1
+      max     = 3
+      initial = 1
+    }
+  }
+
+  allocation_policy {
+    location {
+      zone = "ru-central1-c"
+    }
+  }
+}
+```
+test_autoscaling.yml
+```yml
+---
+### Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      name: nginx
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: registry.k8s.io/hpa-example
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "500m"
+            limits:
+              memory: "500Mi"
+              cpu: "1"
+---
+### Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+spec:
+  selector:
+    app: nginx
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: LoadBalancer
+---
+### HPA
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 20
+```
